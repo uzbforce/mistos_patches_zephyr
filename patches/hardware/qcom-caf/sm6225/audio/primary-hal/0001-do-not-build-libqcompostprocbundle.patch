@@ -1,0 +1,43 @@
+From: uzbforce <oktamovazizbek2010@gmail.com>
+
+Subject: [hardware/qcom-caf/sm6225/audio/primary-hal] do not build libqcompostprocbundle
+
+diff --git a/audio-effects/post_proc/Android.mk b/audio-effects/post_proc/Android.mk
+index 3e8a446..2f2d08e 100644
+--- a/audio-effects/post_proc/Android.mk
++++ b/audio-effects/post_proc/Android.mk
+@@ -107,7 +107,14 @@ ifeq ($(TARGET_COMPILE_WITH_MSM_KERNEL),true)
+         LOCAL_ADDITIONAL_DEPENDENCIES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
+ endif
+ 
+-include $(BUILD_SHARED_LIBRARY)
++# Not built here. The sources include <sound/audio_effects.h>, a techpack/audio
++# uapi header, and this device's kernel tree (Xiaomi's zephyr-w-oss drop) ships
++# no techpack/ at all, so there is nothing to install it from. The stock vendor
++# image has the matching library -- vendor/lib{,_64}/soundfx/
++# libqcompostprocbundle.so, extracted into vendor/xiaomi/zephyr -- built against
++# the stock kernel, and that is the copy the device ends up with.
++# configs/audio_vendor_product.mk leaves it out of MM_AUDIO for the same reason.
++#include $(BUILD_SHARED_LIBRARY)
+ 
+ 
+ ifeq ($(strip $(AUDIO_FEATURE_ENABLED_HW_ACCELERATED_EFFECTS)),true)
+diff --git a/configs/audio_vendor_product.mk b/configs/audio_vendor_product.mk
+index d47afc1..45ebc6e 100644
+--- a/configs/audio_vendor_product.mk
++++ b/configs/audio_vendor_product.mk
+@@ -9,7 +9,13 @@ MM_AUDIO += libcapiv2svarnnvendor
+ MM_AUDIO += libdsd2pcm
+ MM_AUDIO += libFlacSwDec
+ MM_AUDIO += libasphere
+-MM_AUDIO += libqcompostprocbundle
++# Not built: audio-effects/post_proc includes <sound/audio_effects.h>, a
++# techpack/audio uapi header, and this device's kernel tree (Xiaomi's
++# zephyr-w-oss drop, and the uapi set generated from it) ships no techpack at
++# all. The stock library is in the vendor image
++# (vendor/lib(64)/soundfx/libqcompostprocbundle.so) and is what the stock audio
++# HAL next to it expects; the audio HAL loads it through audio_effects.xml.
++#MM_AUDIO += libqcompostprocbundle
+ MM_AUDIO += libqcomvisualizer
+ MM_AUDIO += libqcomvoiceprocessing
+ MM_AUDIO += libshoebox

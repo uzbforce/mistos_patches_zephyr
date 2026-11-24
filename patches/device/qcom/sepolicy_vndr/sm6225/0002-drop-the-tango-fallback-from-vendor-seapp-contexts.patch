@@ -1,0 +1,21 @@
+From: uzbforce <oktamovazizbek2010@gmail.com>
+
+Subject: [device/qcom/sepolicy_vndr/sm6225] drop the tango fallback from vendor seapp contexts
+
+diff --git a/generic/vendor/common/seapp_contexts b/generic/vendor/common/seapp_contexts
+index 1a1d7ce..7a40412 100644
+--- a/generic/vendor/common/seapp_contexts
++++ b/generic/vendor/common/seapp_contexts
+@@ -30,8 +30,10 @@
+ # Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+ 
+-# A fallback in case tango_core is missing something critical that untrusted_app provides
+-user=_app seinfo=tango name=com.google.tango:app domain=untrusted_app type=app_data_file levelFrom=user
++# The Project Tango fallback that used to sit here assigned domain=untrusted_app,
++# a coredomain, from a vendor seapp_contexts. checkseapp in Android 16 rejects
++# that outright ("Forbidden attribute coredomain assigned to domain
++# 'untrusted_app' in vendor_seapp_contexts"), and Tango has been dead since 2018.
+ 
+ #Needed for time service apk
+ user=_app seinfo=platform name=com.qualcomm.timeservice domain=vendor_timeservice_app type=app_data_file levelFrom=all

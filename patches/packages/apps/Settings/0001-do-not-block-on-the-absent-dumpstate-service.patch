@@ -1,0 +1,15 @@
+Subject: [packages/apps/Settings] do not block on the absent dumpstate service
+
+diff --git a/src/com/android/settings/development/EnableVerboseVendorLoggingPreferenceController.java b/src/com/android/settings/development/EnableVerboseVendorLoggingPreferenceController.java
+index 5e850a7..11c86be 100644
+--- a/src/com/android/settings/development/EnableVerboseVendorLoggingPreferenceController.java
++++ b/src/com/android/settings/development/EnableVerboseVendorLoggingPreferenceController.java
+@@ -136,7 +136,7 @@ public class EnableVerboseVendorLoggingPreferenceController
+         android.hardware.dumpstate.IDumpstateDevice service = null;
+         try {
+             service = android.hardware.dumpstate.IDumpstateDevice.Stub.asInterface(
+-                    ServiceManager.waitForDeclaredService(DUMP_STATE_AIDL_SERVICE_NAME));
++                    ServiceManager.getService(DUMP_STATE_AIDL_SERVICE_NAME));
+         } catch (NoSuchElementException e) {
+             if (DBG) Log.e(TAG, "Get AIDL service fail: " + e);
+         }

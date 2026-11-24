@@ -1,0 +1,546 @@
+Subject: [frameworks/base] zephyr device fixes (MistOS adaption)
+
+diff --git a/packages/SystemUI/res/values/dimens.xml b/packages/SystemUI/res/values/dimens.xml
+index 1885bb960..94a315465 100644
+--- a/packages/SystemUI/res/values/dimens.xml
++++ b/packages/SystemUI/res/values/dimens.xml
+@@ -388,6 +388,8 @@
+ 
+     <!-- The padding at start and end of indication text shown on AOD -->
+     <dimen name="keyguard_indication_text_padding">16dp</dimen>
++    <dimen name="face_unlock_icon_margin_top">6dp</dimen>
++    <dimen name="face_unlock_icon_size">24dp</dimen>
+ 
+     <!-- The min height on the indication text shown on AOD -->
+     <dimen name="keyguard_indication_text_min_height">48dp</dimen>
+diff --git a/packages/SystemUI/src/com/android/systemui/biometrics/UdfpsController.java b/packages/SystemUI/src/com/android/systemui/biometrics/UdfpsController.java
+index 39f364530..a66378bf1 100644
+--- a/packages/SystemUI/src/com/android/systemui/biometrics/UdfpsController.java
++++ b/packages/SystemUI/src/com/android/systemui/biometrics/UdfpsController.java
+@@ -20,6 +20,7 @@ import static android.app.StatusBarManager.SESSION_BIOMETRIC_PROMPT;
+ import static android.app.StatusBarManager.SESSION_KEYGUARD;
+ import static android.hardware.biometrics.BiometricFingerprintConstants.FINGERPRINT_ACQUIRED_GOOD;
+ import static android.hardware.biometrics.BiometricFingerprintConstants.FINGERPRINT_ACQUIRED_START;
++import static android.hardware.biometrics.BiometricFingerprintConstants.FINGERPRINT_ACQUIRED_VENDOR;
+ import static android.hardware.biometrics.BiometricRequestConstants.REASON_AUTH_BP;
+ import static android.hardware.biometrics.BiometricRequestConstants.REASON_AUTH_KEYGUARD;
+ import static android.hardware.biometrics.BiometricRequestConstants.REASON_ENROLL_ENROLLING;
+@@ -153,7 +154,10 @@ import javax.inject.Inject;
+ @SysUISingleton
+ public class UdfpsController implements DozeReceiver, Dumpable {
+     private static final String TAG = "UdfpsController";
+-    private static final long AOD_SEND_FINGER_UP_DELAY_MILLIS = 1000;
++    // Last-resort release for the synthetic AOD gesture. The panel can take a
++    // few hundred ms to unblank and accept local HBM before the vendor FOD
++    // capture starts, so 1 s is too short and cuts off valid scans.
++    private static final long AOD_SEND_FINGER_UP_DELAY_MILLIS = 2500;
+ 
+     private static final long MIN_UNCHANGED_INTERACTION_LOG_INTERVAL = 50;
+ 
+@@ -233,7 +237,7 @@ public class UdfpsController implements DozeReceiver, Dumpable {
+     // to turn off high brightness mode. To get around this limitation, the state of the AOD
+     // interrupt is being tracked and a timeout is used as a last resort to turn off high brightness
+     // mode.
+-    private boolean mIsAodInterruptActive;
++    private volatile boolean mIsAodInterruptActive;
+     @Nullable private Runnable mCancelAodFingerUpAction;
+     private boolean mScreenOn;
+     private Runnable mAodInterruptRunnable;
+@@ -437,6 +441,18 @@ public class UdfpsController implements DozeReceiver, Dumpable {
+                 int sensorId,
+                 @BiometricFingerprintConstants.FingerprintAcquired int acquiredInfo
+         ) {
++            // The Xiaomi Goodix HAL reports its FOD lifecycle as vendor acquired
++            // messages (1022 finger-down, 1023 finger-up, 1033/1201 image
++            // states). They are not final image acquisition results. The first
++            // one can arrive before onAodInterrupt sets mIsAodInterruptActive;
++            // treating it as final unconfigures the overlay and cancels capture.
++            // Let authentication, the AOD timer, or a real touch-up release the
++            // gesture instead.
++            if (acquiredInfo == FINGERPRINT_ACQUIRED_VENDOR) {
++                Log.d(TAG, "Ignoring vendor acquired event");
++                return;
++            }
++
+             if (isUltrasonic()) {
+                 if (acquiredInfo == FINGERPRINT_ACQUIRED_START) {
+                     mFgExecutor.execute(() -> {
+@@ -726,6 +742,14 @@ public class UdfpsController implements DozeReceiver, Dumpable {
+                 if (InteractionEvent.CANCEL.equals(processedTouch.getEvent())) {
+                     Log.w(TAG, "This is a CANCEL event that's reported as an UP event!");
+                 }
++                // The AOD sensor does not emit a real ACTION_UP. Touch events
++                // generated while the overlay is being moved onto the screen are
++                // not the user lifting their finger; let the scheduled AOD
++                // finger-up end the synthetic gesture instead.
++                if (mIsAodInterruptActive) {
++                    Log.d(TAG, "Ignoring touch up/cancel during AOD interrupt");
++                    break;
++                }
+                 mAttemptedToDismissKeyguard = false;
+                 onFingerUp(requestId,
+                         mOverlay.getTouchOverlay(),
+@@ -1152,6 +1176,9 @@ public class UdfpsController implements DozeReceiver, Dumpable {
+             return;
+         }
+ 
++        Log.d(TAG, "onAodInterrupt interactive=" + mPowerManager.isInteractive()
++                + " detectionRunning=" + mKeyguardUpdateMonitor.isFingerprintDetectionRunning());
++
+         if (!mKeyguardUpdateMonitor.isFingerprintDetectionRunning()) {
+             if (mFalsingManager.isFalseLongTap(FalsingManager.LOW_PENALTY)) {
+                 Log.v(TAG, "aod lock icon long-press rejected by the falsing manager.");
+@@ -1212,7 +1239,8 @@ public class UdfpsController implements DozeReceiver, Dumpable {
+                 && Settings.Secure.getIntForUser(
+                         mContext.getContentResolver(),
+                         Settings.Secure.SCREEN_OFF_UNLOCK_UDFPS_ENABLED,
+-                        0,
++                        mContext.getResources().getBoolean(
++                                R.bool.config_screen_off_udfps_default_on) ? 1 : 0,
+                         mContext.getUserId()) != 0;
+     }
+ 
+diff --git a/packages/SystemUI/src/com/android/systemui/biometrics/ui/BiometricPromptLayoutState.kt b/packages/SystemUI/src/com/android/systemui/biometrics/ui/BiometricPromptLayoutState.kt
+index d7abab9cb..4b1a396bb 100644
+--- a/packages/SystemUI/src/com/android/systemui/biometrics/ui/BiometricPromptLayoutState.kt
++++ b/packages/SystemUI/src/com/android/systemui/biometrics/ui/BiometricPromptLayoutState.kt
+@@ -25,6 +25,7 @@ data class BiometricPromptLayoutState(
+     val position: PromptPosition,
+     val size: PromptSize,
+     val hideSensorIcon: Boolean,
++    val hasUdfps: Boolean,
+     val guidelineBounds: Rect,
+     val iconPosition: Rect,
+     val iconSize: Pair<Int, Int>,
+diff --git a/packages/SystemUI/src/com/android/systemui/biometrics/ui/binder/BiometricViewSizeBinder.kt b/packages/SystemUI/src/com/android/systemui/biometrics/ui/binder/BiometricViewSizeBinder.kt
+index 26f6b403a..47018e158 100644
+--- a/packages/SystemUI/src/com/android/systemui/biometrics/ui/binder/BiometricViewSizeBinder.kt
++++ b/packages/SystemUI/src/com/android/systemui/biometrics/ui/binder/BiometricViewSizeBinder.kt
+@@ -82,7 +82,10 @@ object BiometricViewSizeBinder {
+                 1f,
+                 view.resources.displayMetrics,
+             )
+-        val cornerRadiusPx = (pxToDp * cornerRadius).toInt()
++        // getDimension() already returns pixels. Multiplying by density here made the
++        // clip outline roughly 2.6x the resource size, which turned the sheet's top
++        // corners into a nearly circular cap on this panel.
++        val cornerRadiusPx = cornerRadius.toInt()
+ 
+         var currentPosition: PromptPosition = PromptPosition.Bottom
+         var currentView: BiometricPromptView? = null
+@@ -480,6 +483,46 @@ object BiometricViewSizeBinder {
+                         R.id.biometric_icon,
+                         currentState.iconSize.second,
+                     )
++                    // The portrait UDFPS icon is placed at the physical sensor, which is above
++                    // the navigation bar. Keep the indicator and buttons above that icon instead
++                    // of anchoring them to the bottom of the screen, where they would overlap the
++                    // icon and get clipped by the chin.
++                    val isPortraitUdfpsPrompt =
++                        currentState.hasUdfps &&
++                            !currentState.hideSensorIcon &&
++                            currentState.activeView == BiometricPromptView.BIOMETRIC &&
++                            currentState.position == PromptPosition.Bottom &&
++                            currentState.size.isMedium
++                    if (isPortraitUdfpsPrompt) {
++                        // Keep the indicator and buttons above the physical sensor. The
++                        // panel itself stays anchored to the bottom of the screen, so the
++                        // scrim below the icon is covered instead of showing as a
++                        // translucent strip.
++                        val spacing = (16 * pxToDp).toInt()
++                        nextConstraintSet.connect(
++                            R.id.button_bar,
++                            ConstraintSet.BOTTOM,
++                            R.id.biometric_icon,
++                            ConstraintSet.TOP,
++                            spacing,
++                        )
++                        nextConstraintSet.clear(R.id.indicator, ConstraintSet.TOP)
++                        nextConstraintSet.connect(
++                            R.id.indicator,
++                            ConstraintSet.BOTTOM,
++                            R.id.button_bar,
++                            ConstraintSet.TOP,
++                            spacing,
++                        )
++                        nextConstraintSet.setMargin(R.id.indicator, ConstraintSet.TOP, 0)
++                        nextConstraintSet.connect(
++                            R.id.scrollView,
++                            ConstraintSet.BOTTOM,
++                            R.id.indicator,
++                            ConstraintSet.TOP,
++                        )
++                    }
++
+                     if (!currentState.position.isCenter) {
+                         currentState.iconPosition.let { iconPosition ->
+                             nextConstraintSet.applyMarginConstraint(
+diff --git a/packages/SystemUI/src/com/android/systemui/biometrics/ui/viewmodel/PromptViewModel.kt b/packages/SystemUI/src/com/android/systemui/biometrics/ui/viewmodel/PromptViewModel.kt
+index 4e017a1a9..082504311 100644
+--- a/packages/SystemUI/src/com/android/systemui/biometrics/ui/viewmodel/PromptViewModel.kt
++++ b/packages/SystemUI/src/com/android/systemui/biometrics/ui/viewmodel/PromptViewModel.kt
+@@ -569,12 +569,15 @@ constructor(
+                 guidelineBounds,
+                 iconViewModel.iconPosition,
+                 iconViewModel.iconSize,
+-            ) { currentView, position, size, hideSensor, guidelines, iconPosition, iconSize ->
++                modalities,
++            ) { currentView, position, size, hideSensor, guidelines, iconPosition, iconSize,
++                modalities ->
+                 BiometricPromptLayoutState(
+                     currentView,
+                     position,
+                     size,
+                     hideSensor,
++                    modalities.hasUdfps,
+                     guidelines,
+                     iconPosition,
+                     iconSize,
+diff --git a/packages/SystemUI/src/com/android/systemui/decor/FaceScanningProviderFactory.kt b/packages/SystemUI/src/com/android/systemui/decor/FaceScanningProviderFactory.kt
+index 32546ede4..8e548c9d2 100644
+--- a/packages/SystemUI/src/com/android/systemui/decor/FaceScanningProviderFactory.kt
++++ b/packages/SystemUI/src/com/android/systemui/decor/FaceScanningProviderFactory.kt
+@@ -75,10 +75,7 @@ constructor(
+             // update display info
+             display?.getDisplayInfo(displayInfo)
+                 ?: run { Log.w(TAG, "display is null, can't update displayInfo") }
+-            return DisplayCutout.getFillBuiltInDisplayCutout(
+-                context.resources,
+-                displayInfo.uniqueId,
+-            )
++            return displayInfo.displayCutout != null
+         }
+ 
+     override val providers: List<DecorProvider>
+diff --git a/packages/SystemUI/src/com/android/systemui/doze/DozeSensors.java b/packages/SystemUI/src/com/android/systemui/doze/DozeSensors.java
+index 38d5006df..c7e899531 100644
+--- a/packages/SystemUI/src/com/android/systemui/doze/DozeSensors.java
++++ b/packages/SystemUI/src/com/android/systemui/doze/DozeSensors.java
+@@ -103,6 +103,7 @@ public class DozeSensors {
+     private final AuthController mAuthController;
+     private final SelectedUserInteractor mSelectedUserInteractor;
+     private final boolean mScreenOffUdfpsEnabled;
++    private final int[] mUdfpsSensorProps;
+ 
+     // Sensors
+     @VisibleForTesting
+@@ -175,6 +176,8 @@ public class DozeSensors {
+         mSelectedUserInteractor = selectedUserInteractor;
+         mScreenOffUdfpsEnabled =
+                 config.screenOffUdfpsEnabled(mSelectedUserInteractor.getSelectedUserId());
++        mUdfpsSensorProps = resources.getIntArray(
++                com.android.internal.R.array.config_udfps_sensor_props);
+         mDevicePostureController = devicePostureController;
+         mDevicePosture = mDevicePostureController.getDevicePosture();
+         mAuthController = authController;
+@@ -244,7 +247,7 @@ public class DozeSensors {
+                         false /* requiresAod */
+                 ),
+                 new TriggerSensor(
+-                        findSensor(config.udfpsLongPressSensorType()),
++                        findUdfpsSensor(config.udfpsLongPressSensorType()),
+                         KEY_DOZE_PULSE_ON_AUTH,
+                         true /* settingDef */,
+                         udfpsLongPressConfigured(),
+@@ -341,6 +344,27 @@ public class DozeSensors {
+         return findSensor(mSensorManager, type, null);
+     }
+ 
++    /**
++     * The vendor registers many of its custom sensors twice, once non-wakeup and once
++     * wakeup, under the same string type. The UDFPS trigger must use the wakeup variant:
++     * the non-wakeup one is suspended with the AP and cannot start authentication while
++     * the display is off.
++     */
++    private Sensor findUdfpsSensor(String type) {
++        Sensor fallback = null;
++        for (Sensor sensor : mSensorManager.getSensorList(Sensor.TYPE_ALL)) {
++            if (type.equals(sensor.getStringType())) {
++                if (sensor.isWakeUpSensor()) {
++                    return sensor;
++                }
++                if (fallback == null) {
++                    fallback = sensor;
++                }
++            }
++        }
++        return fallback;
++    }
++
+     @NonNull
+     private Sensor[] findSensors(@NonNull String[] types) {
+         Sensor[] sensorMap = new Sensor[DevicePostureController.SUPPORTED_POSTURES_SIZE];
+@@ -844,14 +868,29 @@ public class DozeSensors {
+                 }
+ 
+                 mRegistered = false;
++                float[] values = event.values;
++                // The UDFPS sensor only reports a trigger; it does not report touch
++                // coordinates, even though its HIDL event has a full-sized values
++                // array. Always fill them from config_udfps_sensor_props so the
++                // synthetic AOD press lands on the fixed under-display sensor.
++                if (mPulseReason == DozeLog.REASON_SENSOR_UDFPS_LONG_PRESS
++                        && mUdfpsSensorProps.length >= 3) {
++                    values = new float[] {
++                            mUdfpsSensorProps[0],
++                            mUdfpsSensorProps[1],
++                            0f,
++                            mUdfpsSensorProps[2],
++                            mUdfpsSensorProps[2],
++                    };
++                }
+                 float screenX = -1;
+                 float screenY = -1;
+-                if (mReportsTouchCoordinates && event.values.length >= 2) {
+-                    screenX = event.values[0];
+-                    screenY = event.values[1];
++                if (mReportsTouchCoordinates && values.length >= 2) {
++                    screenX = values[0];
++                    screenY = values[1];
+                 }
+                 mSensorCallback.onSensorPulse(mPulseReason, mPerformsProxCheck,
+-                        screenX, screenY, event.values);
++                        screenX, screenY, values);
+                 if (!mRegistered && mImmediatelyReRegister) {
+                     updateListening();
+                 }
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/NotificationShadeWindowControllerImpl.java b/packages/SystemUI/src/com/android/systemui/shade/NotificationShadeWindowControllerImpl.java
+index ae72544ac..35026debd 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/NotificationShadeWindowControllerImpl.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/NotificationShadeWindowControllerImpl.java
+@@ -362,6 +362,23 @@ public class NotificationShadeWindowControllerImpl
+         if (mKeyguardViewMediator.isShowingAndNotOccluded()) {
+             setKeyguardShowing(true);
+         }
++
++        if (!SceneContainerFlag.isEnabled()) {
++            // The notification shade window's occlusion state is normally updated from
++            // NotificationShadeWindowModel, which derives it from the keyguard transition
++            // state machine. That machine is not driven while the WM state refactor is
++            // disabled, so the window kept the keyguard-showing flags and stayed focusable
++            // on top of SHOW_WHEN_LOCKED activities (e.g. the secure camera launched from
++            // the lock screen), swallowing all touch and key input. Mirror the legacy
++            // KeyguardStateController here, as CentralSurfaces does for the scrim.
++            mKeyguardStateController.addCallback(
++                    new KeyguardStateController.Callback() {
++                        @Override
++                        public void onKeyguardShowingChanged() {
++                            setKeyguardOccluded(mKeyguardStateController.isOccluded());
++                        }
++                    });
++        }
+     }
+ 
+     @Nullable
+diff --git a/packages/SystemUI/src/com/android/systemui/statusbar/KeyguardIndicationController.java b/packages/SystemUI/src/com/android/systemui/statusbar/KeyguardIndicationController.java
+index 6f5e594f9..20eeee34e 100644
+--- a/packages/SystemUI/src/com/android/systemui/statusbar/KeyguardIndicationController.java
++++ b/packages/SystemUI/src/com/android/systemui/statusbar/KeyguardIndicationController.java
+@@ -508,6 +508,20 @@ public class KeyguardIndicationController {
+     /**
+      * Notify controller about configuration changes.
+      */
++    public void setIndicationAreaTop(FaceUnlockImageView faceIconView) {
++        mFaceIconView = faceIconView;
++        if (mFaceIconView != null) {
++            mFaceIconView.updateColor();
++        }
++    }
++
++    public void clearIndicationAreaTop(FaceUnlockImageView faceIconView) {
++        if (mFaceIconView == faceIconView) {
++            mFaceIconView = null;
++        }
++    }
++
++
+     public void onConfigurationChanged() {
+         // Get new text color in case theme has changed
+         if (Flags.indicationTextA11yFix()) {
+@@ -1728,6 +1742,7 @@ public class KeyguardIndicationController {
+         @Override
+         public void onBiometricAcquired(BiometricSourceType biometricSourceType, int acquireInfo) {
+             if (biometricSourceType == FACE) {
++                updateFaceIconViewState(FaceUnlockImageView.State.SCANNING);
+                 if (mBiometricMessageSource == BiometricSourceType.FACE
+                         && acquireInfo == FACE_ACQUIRED_START) {
+                     // Let's hide any previous face messages when authentication starts, otherwise
+@@ -1762,6 +1777,9 @@ public class KeyguardIndicationController {
+                     && msgId != BIOMETRIC_HELP_FACE_NOT_AVAILABLE;
+             final boolean faceAuthFailed = biometricSourceType == FACE
+                     && msgId == BIOMETRIC_HELP_FACE_NOT_RECOGNIZED; // ran through matcher & failed
++            if (faceAuthFailed) {
++                updateFaceIconViewState(FaceUnlockImageView.State.NOT_VERIFIED);
++            }
+             if (faceAuthFailed && mFaceLockedOutThisAuthSession) {
+                 mKeyguardLogger.logBiometricMessage(
+                         "skipped showing faceAuthFailed message due to lockout",
+@@ -1844,6 +1862,7 @@ public class KeyguardIndicationController {
+         @Override
+         public void onBiometricAuthFailed(BiometricSourceType biometricSourceType) {
+             if (biometricSourceType == FACE) {
++                updateFaceIconViewState(FaceUnlockImageView.State.NOT_VERIFIED);
+                 mFaceAcquiredMessageDeferral.reset();
+             }
+         }
+@@ -1862,6 +1881,7 @@ public class KeyguardIndicationController {
+         public void onBiometricError(int msgId, String errString,
+                 BiometricSourceType biometricSourceType) {
+             if (biometricSourceType == FACE) {
++                updateFaceIconViewState(FaceUnlockImageView.State.NOT_VERIFIED);
+                 onFaceAuthError(msgId, errString);
+             } else if (biometricSourceType == FINGERPRINT) {
+                 onFingerprintAuthError(msgId, errString);
+@@ -1944,6 +1964,7 @@ public class KeyguardIndicationController {
+             super.onBiometricAuthenticated(userId, biometricSourceType, isStrongBiometric);
+             hideBiometricMessage();
+             if (biometricSourceType == FACE) {
++                updateFaceIconViewState(FaceUnlockImageView.State.SUCCESS);
+                 mFaceAcquiredMessageDeferral.reset();
+                 if (!mKeyguardBypassController.canBypass()) {
+                     showActionToUnlock();
+diff --git a/services/core/Android.bp b/services/core/Android.bp
+index a6a87fce2..f876f86ce 100644
+--- a/services/core/Android.bp
++++ b/services/core/Android.bp
+@@ -219,6 +219,7 @@ java_library_static {
+         "android.hardware.weaver-V1.0-java", // HIDL
+         "android.hardware.weaver-V3-java", // AIDL
+         "android.hardware.biometrics.face-V1.0-java",
++        "vendor.aospa.biometrics.face", // AIDL: Paranoid Sense face provider
+         "android.hardware.biometrics.fingerprint-V2.3-java",
+         "android.hardware.oemlock-V1.0-java",
+         "android.hardware.oemlock-V1-java",
+diff --git a/services/core/java/com/android/server/StorageManagerService.java b/services/core/java/com/android/server/StorageManagerService.java
+index 831158d32..874417e7a 100644
+--- a/services/core/java/com/android/server/StorageManagerService.java
++++ b/services/core/java/com/android/server/StorageManagerService.java
+@@ -997,7 +997,14 @@ class StorageManagerService extends IStorageManager.Stub
+             }
+         }
+ 
+-        configureTranscoding();
++        // Codec enumeration reaches IMediaPlayerService#getCodecList(). On this port
++        // the vendor Codec2 HAL does not start, and that binder call never returns,
++        // so running it here would wedge this handler thread. Every message queued
++        // behind it -- H_BOOT_COMPLETED, H_COMPLETE_UNLOCK_USER, H_VOLUME_MOUNT --
++        // would then go unprocessed and /storage/emulated would stay unmounted for
++        // the whole boot. Keep it off this thread so a stuck codec service can only
++        // affect transcoding.
++        new Thread(this::configureTranscoding, "StorageTranscodeConfig").start();
+ 
+         // Guard the new feature call with the aflag
+         if (Flags.enableFilesystemConfigurationV2()) {
+@@ -2295,6 +2302,21 @@ class StorageManagerService extends IStorageManager.Stub
+ 
+     private void handleBootCompleted() {
+         resetIfBootedAndConnected();
++
++        // The first emulated-volume mount can race MediaProvider startup on some
++        // devices and leave /storage/emulated/0 unmounted for the whole boot.
++        // Retry once the system has settled; a second mount of an already
++        // mounted volume is a no-op in vold.
++        mHandler.postDelayed(() -> {
++            for (int i = 0; i < mVolumes.size(); i++) {
++                final WatchedVolumeInfo vol = mVolumes.valueAt(i);
++                if (vol.getType() == VolumeInfo.TYPE_EMULATED
++                        && vol.getState() == VolumeInfo.STATE_UNMOUNTED) {
++                    Slog.i(TAG, "Retrying mount of " + vol.getId() + " after boot");
++                    mHandler.obtainMessage(H_VOLUME_MOUNT, vol).sendToTarget();
++                }
++            }
++        }, 15000);
+     }
+ 
+     private String getDefaultPrimaryStorageUuid() {
+diff --git a/services/core/java/com/android/server/audio/HardeningEnforcer.java b/services/core/java/com/android/server/audio/HardeningEnforcer.java
+index f6b4eac80..dccd863fb 100644
+--- a/services/core/java/com/android/server/audio/HardeningEnforcer.java
++++ b/services/core/java/com/android/server/audio/HardeningEnforcer.java
+@@ -421,6 +421,19 @@ public class HardeningEnforcer {
+             return false;
+         }
+ 
++        // Android 17's strict background-audio rule also requires the
++        // foreground service to have while-in-use capability. Media apps
++        // commonly keep a non-short media playback service but lose that
++        // capability when playback is restored from the background, so their
++        // focus request is rejected as soon as the screen turns off. Preserve
++        // the baseline rule (no foreground service at all is still rejected)
++        // but do not stop media just because the service is not WIU.
++        if (blockState == DENIED_IF_FULL
++                && aa.getUsage() == AudioAttributes.USAGE_MEDIA) {
++            metricsLogFocusReq(false, focusReqType, callingUid);
++            return false;
++        }
++
+         var overrideState = mHardeningOverride.get();
+         boolean isPreVic = targetSdk < Build.VERSION_CODES.VANILLA_ICE_CREAM;
+         boolean isPreCinnamonBun = targetSdk < Build.VERSION_CODES.CINNAMON_BUN;
+diff --git a/services/core/java/com/android/server/wm/BlurController.java b/services/core/java/com/android/server/wm/BlurController.java
+index 03639449c..259e6a424 100644
+--- a/services/core/java/com/android/server/wm/BlurController.java
++++ b/services/core/java/com/android/server/wm/BlurController.java
+@@ -136,7 +136,10 @@ final class BlurController {
+     }
+ 
+     private boolean getBlurDisabledSetting() {
++        // Default to the blurless UI: blur is opt-in from Settings > Display
++        // ("Reduce blur effects"). Callers that write the setting explicitly
++        // still win over this fallback.
+         return Settings.Global.getInt(mContext.getContentResolver(),
+-                Settings.Global.DISABLE_WINDOW_BLURS, 0) == 1;
++                Settings.Global.DISABLE_WINDOW_BLURS, 1) == 1;
+     }
+ }
+diff --git a/telephony/java/android/telephony/TelephonyBaseUtilsStub.java b/telephony/java/android/telephony/TelephonyBaseUtilsStub.java
+new file mode 100644
+index 000000000..31cd9a026
+--- /dev/null
++++ b/telephony/java/android/telephony/TelephonyBaseUtilsStub.java
+@@ -0,0 +1,45 @@
++/*
++ * Copyright (C) 2026 The LineageOS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package android.telephony;
++
++/**
++ * Stub for the MIUI framework class of the same name.
++ *
++ * <p>The stock {@code org.codeaurora.ims} and {@code QtiTelephony} blobs link
++ * against {@code android.telephony.TelephonyBaseUtilsStub} to ask whether they
++ * are running on MIUI, and pick MIUI-specific telephony code paths when they
++ * are. AOSP/LineageOS has no such class, so the linker fails with
++ * {@code ClassNotFoundException} while the IMS service is being created and the
++ * service crash-loops before it can ever register with
++ * {@code com.android.internal.telephony.ims.ImsResolver}.
++ *
++ * <p>Only {@link #isMiuiRom()} is called by those blobs, and this build is not
++ * MIUI, so it always reports {@code false}.
++ *
++ * @hide
++ */
++public final class TelephonyBaseUtilsStub {
++    private TelephonyBaseUtilsStub() {
++    }
++
++    /**
++     * @return whether this build is MIUI.
++     */
++    public static boolean isMiuiRom() {
++        return false;
++    }
++}
